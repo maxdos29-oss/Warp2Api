@@ -460,6 +460,33 @@ async def startup_tasks():
         logger.error(f"❌ Protobuf运行时初始化失败: {e}")
         raise
     
+    # 初始化并显示Token Pool信息
+    try:
+        from warp2protobuf.core.token_pool import get_token_pool
+        from warp2protobuf.core.auth import print_token_pool_info
+
+        logger.info("="*60)
+        logger.info("🔐 初始化Token Pool...")
+        pool = await get_token_pool()
+        stats = await pool.get_pool_stats()
+
+        logger.info(f"✅ Token Pool已初始化 (优先使用匿名Token以节省个人配额)")
+        logger.info(f"   📊 总Token数: {stats['total_tokens']}")
+        logger.info(f"   ✅ 活跃Token数: {stats['active_tokens']}")
+        logger.info(f"   ❌ 失败Token数: {stats['failed_tokens']}")
+        logger.info(f"   ")
+        logger.info(f"   使用优先级 (从高到低):")
+        logger.info(f"   1️⃣  匿名Token数: {stats['anonymous_tokens']} (最优先)")
+        logger.info(f"   2️⃣  共享Token数: {stats['shared_tokens']}")
+        logger.info(f"   3️⃣  个人Token数: {stats['personal_tokens']} (保底使用)")
+
+        # 显示详细的token信息
+        await print_token_pool_info()
+        logger.info("="*60)
+
+    except Exception as e:
+        logger.warning(f"⚠️ Token Pool初始化失败: {e}")
+
     # 检查JWT token
     try:
         from warp2protobuf.core.auth import get_jwt_token, is_token_expired

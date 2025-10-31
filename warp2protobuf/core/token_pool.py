@@ -24,9 +24,9 @@ from .logging import logger
 
 class TokenPriority(Enum):
     """Token priority levels"""
-    PERSONAL = 1      # Personal tokens (highest priority)
+    ANONYMOUS = 1     # Anonymous tokens (highest priority - to save personal quota)
     SHARED = 2        # Shared tokens (medium priority)
-    ANONYMOUS = 3     # Anonymous tokens (lowest priority)
+    PERSONAL = 3      # Personal tokens (lowest priority - save for when anonymous fails)
 
 
 @dataclass
@@ -68,6 +68,11 @@ class TokenPool:
             TokenPriority.SHARED: 0,
             TokenPriority.ANONYMOUS: 0,
         }
+        self._last_used_index: Dict[TokenPriority, int] = {
+            TokenPriority.PERSONAL: 0,
+            TokenPriority.SHARED: 0,
+            TokenPriority.ANONYMOUS: 0,
+        }
         self._failed_tokens: Set[str] = set()
         self._max_failures = 3  # Max failures before marking token as inactive
         self._initialized = False
@@ -79,21 +84,21 @@ class TokenPool:
                 return
             
             logger.info("🔄 Initializing token pool...")
-            
-            # Load personal tokens (highest priority)
-            personal_tokens = self._load_personal_tokens()
-            for token in personal_tokens:
-                self._add_token_internal(token, TokenPriority.PERSONAL)
-            
+
+            # Load anonymous/fallback token (highest priority - to save personal quota)
+            anonymous_token = self._load_anonymous_token()
+            if anonymous_token:
+                self._add_token_internal(anonymous_token, TokenPriority.ANONYMOUS)
+
             # Load shared tokens (medium priority)
             shared_tokens = self._load_shared_tokens()
             for token in shared_tokens:
                 self._add_token_internal(token, TokenPriority.SHARED)
-            
-            # Load anonymous/fallback token (lowest priority)
-            anonymous_token = self._load_anonymous_token()
-            if anonymous_token:
-                self._add_token_internal(anonymous_token, TokenPriority.ANONYMOUS)
+
+            # Load personal tokens (lowest priority - save for when anonymous fails)
+            personal_tokens = self._load_personal_tokens()
+            for token in personal_tokens:
+                self._add_token_internal(token, TokenPriority.PERSONAL)
             
             self._initialized = True
             self._log_pool_status()
@@ -188,14 +193,14 @@ class TokenPool:
             await self.initialize()
         
         async with self._lock:
-            # Try each priority level in order
-            for priority in [TokenPriority.PERSONAL, TokenPriority.SHARED, TokenPriority.ANONYMOUS]:
+            # Try each priority level in order (ANONYMOUS first to save personal quota)
+            for priority in [TokenPriority.ANONYMOUS, TokenPriority.SHARED, TokenPriority.PERSONAL]:
                 token = self._get_token_by_priority(priority)
                 if token:
                     token.last_used = time.time()
                     logger.debug(f"🎯 Selected token: {token.name} (priority: {priority.name})")
                     return token
-            
+
             logger.error("❌ No available tokens in pool!")
             return None
     
@@ -219,11 +224,72 @@ class TokenPool:
         
         return token
     
+    def get_last_used_token(self) -> Optional[TokenInfo]:
+        """
+        Get the most recently used token.
+
+        Returns:
+            TokenInfo if available, None if no tokens have been used
+        """
+        if not self._tokens:
+            return None
+
+        # Find the token with the most recent last_used timestamp
+        most_recent = None
+        for token in self._tokens:
+            if token.last_used > 0:
+                if most_recent is None or token.last_used > most_recent.last_used:
+                    most_recent = token
+
+        return most_recent
+
+    async def get_next_token_excluding(self, exclude_token: Optional[str] = None) -> Optional[TokenInfo]:
+        """
+        Get the next available token, excluding a specific token.
+        Useful when current token fails and we need to try a different one.
+
+        Args:
+            exclude_token: refresh_token string to exclude from selection
+
+        Returns:
+            TokenInfo if available, None if no other tokens available
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        async with self._lock:
+            # Try each priority level in order (ANONYMOUS first to save personal quota)
+            for priority in [TokenPriority.ANONYMOUS, TokenPriority.SHARED, TokenPriority.PERSONAL]:
+                # Get all active tokens of this priority, excluding the specified token
+                priority_tokens = [
+                    t for t in self._tokens
+                    if t.priority == priority
+                    and t.is_active
+                    and t.refresh_token not in self._failed_tokens
+                    and (exclude_token is None or t.refresh_token != exclude_token)
+                ]
+
+                if priority_tokens:
+                    # Use round-robin within same priority
+                    if priority not in self._last_used_index:
+                        self._last_used_index[priority] = 0
+
+                    idx = self._last_used_index[priority] % len(priority_tokens)
+                    token = priority_tokens[idx]
+                    self._last_used_index[priority] = (idx + 1) % len(priority_tokens)
+
+                    token.last_used = time.time()
+                    logger.debug(f"🎯 Selected token (excluding {exclude_token[:20] if exclude_token else 'none'}...): {token.name} (priority: {priority.name})")
+                    return token
+
+            logger.error("❌ No other available tokens in pool!")
+            return None
+
     async def mark_token_failed(self, token_info: TokenInfo):
         """Mark a token as failed and potentially deactivate it"""
         async with self._lock:
             token_info.failure_count += 1
-            
+
             if token_info.failure_count >= self._max_failures:
                 token_info.is_active = False
                 self._failed_tokens.add(token_info.refresh_token)
@@ -251,7 +317,7 @@ class TokenPool:
                 "failed_tokens": len(self._failed_tokens),
                 "by_priority": {}
             }
-            
+
             for priority in TokenPriority:
                 priority_tokens = [t for t in self._tokens if t.priority == priority]
                 active_count = sum(1 for t in priority_tokens if t.is_active)
@@ -260,7 +326,12 @@ class TokenPool:
                     "active": active_count,
                     "inactive": len(priority_tokens) - active_count
                 }
-            
+
+            # Add convenience keys for direct access
+            stats["personal_tokens"] = stats["by_priority"].get("PERSONAL", {}).get("active", 0)
+            stats["shared_tokens"] = stats["by_priority"].get("SHARED", {}).get("active", 0)
+            stats["anonymous_tokens"] = stats["by_priority"].get("ANONYMOUS", {}).get("active", 0)
+
             return stats
     
     def _log_pool_status(self):
@@ -269,13 +340,14 @@ class TokenPool:
         active = sum(1 for t in self._tokens if t.is_active)
 
         by_priority = {}
-        for priority in TokenPriority:
+        # Show in priority order (ANONYMOUS first)
+        for priority in [TokenPriority.ANONYMOUS, TokenPriority.SHARED, TokenPriority.PERSONAL]:
             count = sum(1 for t in self._tokens if t.priority == priority and t.is_active)
             if count > 0:
                 by_priority[priority.name] = count
 
         priority_str = ", ".join(f"{k}: {v}" for k, v in by_priority.items())
-        logger.info(f"📊 Token Pool: {active}/{total} active tokens ({priority_str})")
+        logger.info(f"📊 Token Pool: {active}/{total} active tokens (优先级: {priority_str})")
 
     async def health_check(self) -> Dict:
         """

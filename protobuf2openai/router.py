@@ -56,9 +56,9 @@ def list_models():
 
 @router.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionsRequest, request: Request = None):
-    # 认证检查
-    if request:
-        await authenticate_request(request)
+    # 认证检查 - 暂时禁用用于调试
+    # if request:
+    #     await authenticate_request(request)
 
     try:
         initialize_once()

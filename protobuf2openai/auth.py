@@ -4,6 +4,10 @@ import os
 from typing import Optional
 from fastapi import HTTPException, Request, status
 from fastapi.responses import JSONResponse
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 
 class BearerTokenAuth:
@@ -17,6 +21,9 @@ class BearerTokenAuth:
             expected_token: 预期的Bearer token，如果为None则从环境变量读取
         """
         self.expected_token = expected_token or os.getenv("API_TOKEN")
+
+        # Debug: print expected token
+        print(f"🔑 BearerTokenAuth initialized with expected_token: {self.expected_token}")
 
         # 如果没有设置token，强制要求设置
         if not self.expected_token:

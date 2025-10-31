@@ -9,6 +9,7 @@ import httpx
 import os
 import base64
 import binascii
+import time
 from typing import Optional, Any, Dict
 from urllib.parse import urlparse
 import socket
@@ -16,6 +17,7 @@ import socket
 from ..core.logging import logger
 from ..core.protobuf_utils import protobuf_to_dict
 from ..core.auth import get_valid_jwt, acquire_anonymous_access_token
+from ..core.token_pool import get_token_pool
 from ..config.settings import WARP_URL as CONFIG_WARP_URL
 
 
@@ -85,8 +87,38 @@ async def send_protobuf_to_warp_api(
 
         async with httpx.AsyncClient(http2=True, timeout=httpx.Timeout(60.0), verify=verify_opt, trust_env=True) as client:
             # 最多尝试两次：第一次失败且为配额429时申请匿名token并重试一次
+            current_token_refresh = None  # Track which refresh token is being used
+            current_token_info = None  # Track current TokenInfo object
+
+            # 第一次请求：从token pool获取token
+            if True:  # Always use token pool
+                pool = await get_token_pool()
+                current_token_info = await pool.get_next_token()
+                if current_token_info:
+                    # 检查JWT是否有效，如果无效则刷新
+                    if current_token_info.last_jwt and current_token_info.last_jwt_expiry > time.time() + 120:
+                        # JWT有效且未过期（至少还有2分钟）
+                        jwt = current_token_info.last_jwt
+                        logger.info(f"🎯 使用token pool中的token: {current_token_info.name} (优先级: {current_token_info.priority.name}, 使用缓存JWT)")
+                    else:
+                        # JWT无效或即将过期，需要刷新
+                        logger.info(f"🔄 刷新token pool中的token: {current_token_info.name}")
+                        from ..core.auth import refresh_jwt_token_with_token_info
+                        token_data = await refresh_jwt_token_with_token_info(current_token_info)
+                        if token_data and "access_token" in token_data:
+                            jwt = token_data["access_token"]
+                            logger.info(f"✅ Token刷新成功: {current_token_info.name}")
+                        else:
+                            logger.error(f"❌ Token刷新失败，使用环境变量中的JWT")
+                            jwt = await get_valid_jwt()
+
+                    current_token_refresh = current_token_info.refresh_token
+                else:
+                    # Fallback to old method if pool is empty
+                    jwt = await get_valid_jwt()
+                    logger.warning("⚠️ Token pool为空，使用环境变量中的JWT")
+
             for attempt in range(2):
-                jwt = await get_valid_jwt() if attempt == 0 else jwt  # keep existing unless refreshed explicitly
                 headers = {
                     "accept": "text/event-stream",
                     "content-type": "application/x-protobuf", 
@@ -101,23 +133,111 @@ async def send_protobuf_to_warp_api(
                     if response.status_code != 200:
                         error_text = await response.aread()
                         error_content = error_text.decode('utf-8') if error_text else "No error content"
-                        # 检测配额耗尽错误并在第一次失败时尝试申请匿名token
+
+                        # 记录详细的错误信息
+                        logger.error(f"❌ Warp API返回错误状态码: {response.status_code}")
+                        logger.error(f"   错误内容: {error_content[:500]}")
+                        logger.error(f"   响应头: {dict(response.headers)}")
+                        logger.error(f"   请求大小: {len(protobuf_bytes)} 字节")
+                        logger.error(f"   尝试次数: {attempt + 1}/2")
+
+                        # 检测配额耗尽错误并在第一次失败时尝试使用token pool中的下一个token
                         if response.status_code == 429 and attempt == 0 and (
                             ("No remaining quota" in error_content) or ("No AI requests remaining" in error_content)
                         ):
-                            logger.warning("WARP API 返回 429 (配额用尽)。尝试申请匿名token并重试一次…")
+                            logger.warning("⚠️ WARP API 返回 429 (配额用尽)。尝试从token pool获取下一个token并重试…")
                             try:
-                                new_jwt = await acquire_anonymous_access_token()
-                            except Exception:
-                                new_jwt = None
-                            if new_jwt:
-                                jwt = new_jwt
-                                # 跳出当前响应并进行下一次尝试
-                                continue
-                            else:
-                                logger.error("匿名token申请失败，无法重试。")
-                                logger.error(f"WARP API HTTP ERROR {response.status_code}: {error_content}")
-                                return f"❌ Warp API Error (HTTP {response.status_code}): {error_content}", None, None
+                                # 尝试从token pool获取下一个可用token（排除当前失败的token）
+                                pool = await get_token_pool()
+
+                                # 显示当前token pool状态
+                                pool_stats = await pool.get_pool_stats()
+                                logger.info(f"📊 Token pool状态: 总数={pool_stats['total_tokens']}, 活跃={pool_stats['active_tokens']}, 匿名={pool_stats['anonymous_tokens']}, 个人={pool_stats['personal_tokens']}")
+
+                                # 如果current_token_refresh为None，尝试获取最后使用的token
+                                if current_token_refresh is None:
+                                    last_used = pool.get_last_used_token()
+                                    if last_used:
+                                        current_token_refresh = last_used.refresh_token
+                                        logger.info(f"🔍 检测到最后使用的token: {last_used.name} (last_used={last_used.last_used})")
+                                    else:
+                                        logger.warning("⚠️ 无法检测到最后使用的token")
+                                else:
+                                    logger.info(f"🔍 当前使用的token: {current_token_refresh[:20]}...")
+
+                                logger.info(f"🔄 尝试获取下一个token (排除: {current_token_refresh[:20] if current_token_refresh else 'None'}...)")
+                                token_info = await pool.get_next_token_excluding(current_token_refresh)
+                                logger.info(f"🔍 get_next_token_excluding返回: {token_info.name if token_info else 'None'}")
+
+                                if not token_info:
+                                    # 没有其他token了，尝试申请新的匿名token
+                                    logger.warning("⚠️ Token pool中没有其他可用token，尝试申请新的匿名token…")
+                                    try:
+                                        new_jwt = await acquire_anonymous_access_token()
+                                        if new_jwt:
+                                            logger.info("✅ 成功申请新的匿名token")
+                                            jwt = new_jwt
+                                            current_token_refresh = None  # New anonymous token
+                                            continue
+                                    except Exception as anon_err:
+                                        logger.error(f"❌ 申请匿名token失败: {anon_err}")
+
+                                    logger.error("❌ 所有token尝试失败")
+                                    logger.error(f"WARP API HTTP ERROR {response.status_code}: {error_content}")
+                                    return f"❌ Warp API Error (HTTP {response.status_code}): {error_content}", None, None
+
+                                if token_info and token_info.last_jwt:
+                                    # 使用缓存的JWT
+                                    logger.info(f"✅ 使用token pool中的下一个token: {token_info.name}")
+                                    jwt = token_info.last_jwt
+                                    current_token_refresh = token_info.refresh_token  # Track current token
+                                    continue
+                                elif token_info:
+                                    # 需要刷新JWT
+                                    logger.info(f"🔄 刷新token pool中的token: {token_info.name}")
+                                    from ..core.auth import refresh_jwt_token_with_token_info
+                                    token_data = await refresh_jwt_token_with_token_info(token_info)
+                                    if token_data and "access_token" in token_data:
+                                        jwt = token_data["access_token"]
+                                        current_token_refresh = token_info.refresh_token  # Track current token
+                                        logger.info(f"✅ Token刷新成功，使用新JWT重试")
+                                        continue
+
+                            except Exception as e:
+                                logger.error(f"❌ Token pool处理失败: {e}")
+
+                            # 如果到这里，说明所有尝试都失败了
+                            logger.error(f"WARP API HTTP ERROR {response.status_code}: {error_content}")
+                            return f"❌ Warp API Error (HTTP {response.status_code}): {error_content}", None, None
+
+                        # 特殊处理500错误 - 可能是token问题，尝试切换token
+                        if response.status_code == 500 and attempt == 0:
+                            logger.warning("⚠️ WARP API 返回 500 (服务器错误)。尝试切换到下一个token重试…")
+                            try:
+                                pool = await get_token_pool()
+
+                                # 如果current_token_refresh为None，尝试获取最后使用的token
+                                if current_token_refresh is None:
+                                    last_used = pool.get_last_used_token()
+                                    if last_used:
+                                        current_token_refresh = last_used.refresh_token
+                                        logger.info(f"🔍 检测到最后使用的token: {last_used.name}")
+
+                                # 获取下一个token（排除当前失败的token）
+                                token_info = await pool.get_next_token_excluding(current_token_refresh)
+
+                                if token_info:
+                                    logger.info(f"🔄 切换到token: {token_info.name}")
+                                    current_token_refresh = token_info.refresh_token  # 更新当前token
+                                    from ..core.auth import refresh_jwt_token_with_token_info
+                                    token_data = await refresh_jwt_token_with_token_info(token_info)
+                                    if token_data and "access_token" in token_data:
+                                        jwt = token_data["access_token"]
+                                        logger.info(f"✅ 使用新token重试")
+                                        continue
+                            except Exception as e:
+                                logger.error(f"❌ 切换token失败: {e}")
+
                         # 其他错误或第二次失败
                         logger.error(f"WARP API HTTP ERROR {response.status_code}: {error_content}")
                         return f"❌ Warp API Error (HTTP {response.status_code}): {error_content}", None, None
@@ -269,8 +389,38 @@ async def send_protobuf_to_warp_api_parsed(protobuf_bytes: bytes) -> tuple[str, 
 
         async with httpx.AsyncClient(http2=True, timeout=httpx.Timeout(60.0), verify=verify_opt, trust_env=True) as client:
             # 最多尝试两次：第一次失败且为配额429时申请匿名token并重试一次
+            current_token_refresh = None  # Track which refresh token is being used
+            current_token_info = None  # Track current TokenInfo object
+
+            # 第一次请求：从token pool获取token
+            if True:  # Always use token pool
+                pool = await get_token_pool()
+                current_token_info = await pool.get_next_token()
+                if current_token_info:
+                    # 检查JWT是否有效，如果无效则刷新
+                    if current_token_info.last_jwt and current_token_info.last_jwt_expiry > time.time() + 120:
+                        # JWT有效且未过期（至少还有2分钟）
+                        jwt = current_token_info.last_jwt
+                        logger.info(f"🎯 使用token pool中的token (解析模式): {current_token_info.name} (优先级: {current_token_info.priority.name}, 使用缓存JWT)")
+                    else:
+                        # JWT无效或即将过期，需要刷新
+                        logger.info(f"🔄 刷新token pool中的token (解析模式): {current_token_info.name}")
+                        from ..core.auth import refresh_jwt_token_with_token_info
+                        token_data = await refresh_jwt_token_with_token_info(current_token_info)
+                        if token_data and "access_token" in token_data:
+                            jwt = token_data["access_token"]
+                            logger.info(f"✅ Token刷新成功 (解析模式): {current_token_info.name}")
+                        else:
+                            logger.error(f"❌ Token刷新失败，使用环境变量中的JWT (解析模式)")
+                            jwt = await get_valid_jwt()
+
+                    current_token_refresh = current_token_info.refresh_token
+                else:
+                    # Fallback to old method if pool is empty
+                    jwt = await get_valid_jwt()
+                    logger.warning("⚠️ Token pool为空，使用环境变量中的JWT (解析模式)")
+
             for attempt in range(2):
-                jwt = await get_valid_jwt() if attempt == 0 else jwt  # keep existing unless refreshed explicitly
                 headers = {
                     "accept": "text/event-stream",
                     "content-type": "application/x-protobuf", 
@@ -285,23 +435,118 @@ async def send_protobuf_to_warp_api_parsed(protobuf_bytes: bytes) -> tuple[str, 
                     if response.status_code != 200:
                         error_text = await response.aread()
                         error_content = error_text.decode('utf-8') if error_text else "No error content"
-                        # 检测配额耗尽错误并在第一次失败时尝试申请匿名token
+
+                        # 记录详细的错误信息
+                        logger.error(f"❌ Warp API返回错误状态码: {response.status_code}")
+                        logger.error(f"   错误内容: {error_content[:500]}")
+                        logger.error(f"   响应头: {dict(response.headers)}")
+                        logger.error(f"   请求大小: {len(protobuf_bytes)} 字节")
+                        logger.error(f"   尝试次数: {attempt + 1}/2")
+
+                        # 检测配额耗尽错误并在第一次失败时尝试使用token pool中的下一个token
                         if response.status_code == 429 and attempt == 0 and (
                             ("No remaining quota" in error_content) or ("No AI requests remaining" in error_content)
                         ):
-                            logger.warning("WARP API 返回 429 (配额用尽, 解析模式)。尝试申请匿名token并重试一次…")
+                            logger.warning("⚠️ WARP API 返回 429 (配额用尽, 解析模式)。尝试从token pool获取下一个token并重试…")
                             try:
+                                # 尝试从token pool获取下一个可用token（排除当前失败的token）
+                                pool = await get_token_pool()
+
+                                # 显示当前token pool状态
+                                pool_stats = await pool.get_pool_stats()
+                                logger.info(f"📊 Token pool状态 (解析模式): 总数={pool_stats['total_tokens']}, 活跃={pool_stats['active_tokens']}, 匿名={pool_stats['anonymous_tokens']}, 个人={pool_stats['personal_tokens']}")
+
+                                # 如果current_token_refresh为None，尝试获取最后使用的token
+                                if current_token_refresh is None:
+                                    last_used = pool.get_last_used_token()
+                                    if last_used:
+                                        current_token_refresh = last_used.refresh_token
+                                        logger.info(f"🔍 检测到最后使用的token (解析模式): {last_used.name} (last_used={last_used.last_used})")
+                                    else:
+                                        logger.warning("⚠️ 无法检测到最后使用的token (解析模式)")
+                                else:
+                                    logger.info(f"🔍 当前使用的token (解析模式): {current_token_refresh[:20]}...")
+
+                                logger.info(f"🔄 尝试获取下一个token (解析模式, 排除: {current_token_refresh[:20] if current_token_refresh else 'None'}...)")
+                                token_info = await pool.get_next_token_excluding(current_token_refresh)
+                                logger.info(f"🔍 get_next_token_excluding返回 (解析模式): {token_info.name if token_info else 'None'}")
+
+                                if not token_info:
+                                    # 没有其他token了，尝试申请新的匿名token
+                                    logger.warning("⚠️ Token pool中没有其他可用token，尝试申请新的匿名token…")
+                                    try:
+                                        new_jwt = await acquire_anonymous_access_token()
+                                        if new_jwt:
+                                            logger.info("✅ 成功申请新的匿名token (解析模式)")
+                                            jwt = new_jwt
+                                            current_token_refresh = None  # New anonymous token
+                                            continue
+                                    except Exception as anon_err:
+                                        logger.error(f"❌ 申请匿名token失败: {anon_err}")
+
+                                    logger.error("❌ 所有token尝试失败")
+                                    logger.error(f"WARP API HTTP ERROR (解析模式) {response.status_code}: {error_content}")
+                                    return f"❌ Warp API Error (HTTP {response.status_code}): {error_content}", None, None, []
+
+                                if token_info and token_info.last_jwt:
+                                    # 使用缓存的JWT
+                                    logger.info(f"✅ 使用token pool中的下一个token: {token_info.name} (解析模式)")
+                                    jwt = token_info.last_jwt
+                                    current_token_refresh = token_info.refresh_token  # Track current token
+                                    continue
+                                elif token_info:
+                                    # 需要刷新JWT
+                                    logger.info(f"🔄 刷新token pool中的token: {token_info.name} (解析模式)")
+                                    from ..core.auth import refresh_jwt_token_with_token_info
+                                    token_data = await refresh_jwt_token_with_token_info(token_info)
+                                    if token_data and "access_token" in token_data:
+                                        jwt = token_data["access_token"]
+                                        current_token_refresh = token_info.refresh_token  # Track current token
+                                        logger.info(f"✅ Token刷新成功，使用新JWT重试 (解析模式)")
+                                        continue
+
+                                # 如果token pool中没有可用token，尝试申请匿名token作为最后手段
+                                logger.warning("⚠️ Token pool中没有可用token，尝试申请匿名token作为后备… (解析模式)")
                                 new_jwt = await acquire_anonymous_access_token()
-                            except Exception:
-                                new_jwt = None
-                            if new_jwt:
-                                jwt = new_jwt
-                                # 跳出当前响应并进行下一次尝试
-                                continue
-                            else:
-                                logger.error("匿名token申请失败，无法重试 (解析模式)。")
-                                logger.error(f"WARP API HTTP ERROR (解析模式) {response.status_code}: {error_content}")
-                                return f"❌ Warp API Error (HTTP {response.status_code}): {error_content}", None, None, []
+                                if new_jwt:
+                                    jwt = new_jwt
+                                    continue
+
+                            except Exception as e:
+                                logger.error(f"❌ Token pool处理失败 (解析模式): {e}")
+
+                            # 如果到这里，说明所有尝试都失败了
+                            logger.error(f"WARP API HTTP ERROR (解析模式) {response.status_code}: {error_content}")
+                            return f"❌ Warp API Error (HTTP {response.status_code}): {error_content}", None, None, []
+
+                        # 特殊处理500错误 - 可能是token问题，尝试切换token
+                        if response.status_code == 500 and attempt == 0:
+                            logger.warning("⚠️ WARP API 返回 500 (服务器错误)。尝试切换到下一个token重试…")
+                            try:
+                                pool = await get_token_pool()
+
+                                # 如果current_token_refresh为None，尝试获取最后使用的token
+                                if current_token_refresh is None:
+                                    last_used = pool.get_last_used_token()
+                                    if last_used:
+                                        current_token_refresh = last_used.refresh_token
+                                        logger.info(f"🔍 检测到最后使用的token: {last_used.name}")
+
+                                # 获取下一个token（排除当前失败的token）
+                                token_info = await pool.get_next_token_excluding(current_token_refresh)
+
+                                if token_info:
+                                    logger.info(f"🔄 切换到token: {token_info.name}")
+                                    current_token_refresh = token_info.refresh_token  # 更新当前token
+                                    from ..core.auth import refresh_jwt_token_with_token_info
+                                    token_data = await refresh_jwt_token_with_token_info(token_info)
+                                    if token_data and "access_token" in token_data:
+                                        jwt = token_data["access_token"]
+                                        logger.info(f"✅ 使用新token重试")
+                                        continue
+                            except Exception as e:
+                                logger.error(f"❌ 切换token失败: {e}")
+
                         # 其他错误或第二次失败
                         logger.error(f"WARP API HTTP ERROR (解析模式) {response.status_code}: {error_content}")
                         return f"❌ Warp API Error (HTTP {response.status_code}): {error_content}", None, None, []

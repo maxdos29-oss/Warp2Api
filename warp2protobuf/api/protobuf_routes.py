@@ -19,7 +19,8 @@ from pydantic import BaseModel
 
 from ..core.logging import logger
 from ..core.protobuf_utils import protobuf_to_dict, dict_to_protobuf_bytes
-from ..core.auth import get_jwt_token, refresh_jwt_if_needed, is_token_expired, get_valid_jwt, acquire_anonymous_access_token
+from ..core.auth import get_jwt_token, refresh_jwt_if_needed, is_token_expired, get_valid_jwt, acquire_anonymous_access_token, refresh_jwt_token_with_token_info
+from ..core.token_pool import get_token_pool
 from ..core.stream_processor import get_stream_processor, set_websocket_manager
 from ..config.models import get_all_unique_models
 from ..config.settings import CLIENT_VERSION, OS_CATEGORY, OS_NAME, OS_VERSION, WARP_URL as CONFIG_WARP_URL
@@ -511,19 +512,48 @@ async def send_to_warp_api_stream_sse(request: EncodeRequest):
                         if response.status_code != 200:
                             error_text = await response.aread()
                             error_content = error_text.decode("utf-8") if error_text else ""
-                            # 429 且包含配额信息时，申请匿名token后重试一次
+                            # 429 且包含配额信息时，尝试使用token pool中的下一个token
                             if response.status_code == 429 and attempt == 0 and (
                                 ("No remaining quota" in error_content) or ("No AI requests remaining" in error_content)
                             ):
-                                logger.warning("Warp API 返回 429 (配额用尽, SSE 代理)。尝试申请匿名token并重试一次…")
+                                logger.warning("Warp API 返回 429 (配额用尽, SSE 代理)。尝试从token pool获取下一个token并重试…")
                                 try:
+                                    # 尝试从token pool获取下一个可用token
+                                    pool = await get_token_pool()
+                                    token_info = await pool.get_next_token()
+
+                                    if token_info and token_info.cached_jwt:
+                                        # 使用缓存的JWT
+                                        logger.info(f"✅ 使用token pool中的下一个token: {token_info.name} (SSE 代理)")
+                                        jwt = token_info.cached_jwt
+                                        continue
+                                    elif token_info:
+                                        # 需要刷新JWT
+                                        logger.info(f"🔄 刷新token pool中的token: {token_info.name} (SSE 代理)")
+                                        token_data = await refresh_jwt_token_with_token_info(token_info)
+                                        if token_data and "access_token" in token_data:
+                                            jwt = token_data["access_token"]
+                                            logger.info(f"✅ Token刷新成功，使用新JWT重试 (SSE 代理)")
+                                            continue
+
+                                    # 如果token pool中没有可用token，尝试申请匿名token作为最后手段
+                                    logger.warning("⚠️ Token pool中没有可用token，尝试申请匿名token作为后备… (SSE 代理)")
                                     new_jwt = await acquire_anonymous_access_token()
-                                except Exception:
-                                    new_jwt = None
-                                if new_jwt:
-                                    jwt = new_jwt
-                                    # 重试
-                                    continue
+                                    if new_jwt:
+                                        jwt = new_jwt
+                                        continue
+
+                                except Exception as e:
+                                    logger.error(f"❌ Token pool处理失败 (SSE 代理): {e}")
+                                    # 尝试申请匿名token作为最后手段
+                                    try:
+                                        new_jwt = await acquire_anonymous_access_token()
+                                        if new_jwt:
+                                            jwt = new_jwt
+                                            continue
+                                    except Exception:
+                                        pass
+
                             logger.error(f"Warp API HTTP error {response.status_code}: {error_content[:300]}")
                             yield f"data: {{\"error\": \"HTTP {response.status_code}\"}}\n\n"
                             yield "data: [DONE]\n\n"
