@@ -47,7 +47,7 @@
     # 设置为 true 启用详细日志输出，默认 false（静默模式）
     W2A_VERBOSE=false
 
-    # Bridge服务器URL配置 - 修复端口配置问题
+    # Bridge服务器URL配置
     WARP_BRIDGE_URL=http://127.0.0.1:28888
 
     # 禁用代理以避免连接问题
@@ -55,9 +55,23 @@
     HTTPS_PROXY=
     NO_PROXY=127.0.0.1,localhost
 
-    # 可选：使用自己的Warp凭证（不推荐，会消耗订阅额度）
-    WARP_JWT=your_jwt_token_here
-    WARP_REFRESH_TOKEN=your_refresh_token_here
+    # ==================== 多Token配置（推荐） ====================
+    # 支持配置多个refresh token，系统会按优先级自动选择和轮换
+
+    # 个人refresh token（最高优先级，优先使用）
+    WARP_REFRESH_TOKEN=your_personal_token_here
+
+    # 多个个人tokens（可选，逗号分隔）
+    # 如果有多个个人账号，可以配置多个token，系统会自动轮换
+    # WARP_PERSONAL_TOKENS=token1,token2,token3
+
+    # 共享tokens（中等优先级，可选）
+    # 团队共享的tokens，当个人token失败时使用
+    # WARP_SHARED_TOKENS=shared_token1,shared_token2
+
+    # 匿名token（最低优先级，可选）
+    # 如果不配置，会使用内置的匿名token作为后备
+    # WARP_ANONYMOUS_TOKEN=anonymous_token_here
     ```
 
 ## 🎯 使用方法
@@ -288,12 +302,62 @@ main();
 
 ## 🔧 配置
 
+### 多Token配置（新功能）
+
+Warp2Api 现在支持配置多个refresh token，实现智能负载均衡和自动故障转移。
+
+#### Token优先级策略
+
+系统按以下优先级使用token：
+
+1. **个人Token（最高优先级）** 🔑
+   - 从 `WARP_REFRESH_TOKEN` 或 `WARP_PERSONAL_TOKENS` 读取
+   - 优先使用，适合个人账号
+   - 支持配置多个，自动轮换使用
+
+2. **共享Token（中等优先级）** 👥
+   - 从 `WARP_SHARED_TOKENS` 读取
+   - 团队共享使用，当个人token失败时启用
+   - 支持配置多个，自动轮换使用
+
+3. **匿名Token（最低优先级）** 🌐
+   - 从 `WARP_ANONYMOUS_TOKEN` 读取，或使用内置token
+   - 作为最后的后备方案
+   - 确保服务始终可用
+
+#### 配置示例
+
+```env
+# 单个个人token
+WARP_REFRESH_TOKEN=AMf-vBxSRmdh...
+
+# 或配置多个个人tokens（逗号分隔）
+WARP_PERSONAL_TOKENS=token1_here,token2_here,token3_here
+
+# 可选：配置共享tokens
+WARP_SHARED_TOKENS=shared_token1,shared_token2
+
+# 可选：配置匿名token（不配置则使用内置）
+WARP_ANONYMOUS_TOKEN=anonymous_token_here
+```
+
+#### 特性
+
+- ✅ **自动轮换**：同优先级的token自动轮换使用，避免单个token过载
+- ✅ **故障转移**：token失败时自动切换到下一个可用token
+- ✅ **健康监控**：自动监控token健康状态，失败3次后自动禁用
+- ✅ **自动恢复**：支持手动或自动恢复失败的token
+- ✅ **优先使用个人token**：确保个人账号的token优先被使用
+
 ### 环境变量
 
 | 变量 | 描述 | 默认值 |
 |------|------|--------|
 | `WARP_JWT` | Warp 认证 JWT 令牌 | 自动获取 |
-| `WARP_REFRESH_TOKEN` | JWT 刷新令牌 | 可选 |
+| `WARP_REFRESH_TOKEN` | 个人JWT刷新令牌（单个） | 可选 |
+| `WARP_PERSONAL_TOKENS` | 个人JWT刷新令牌（多个，逗号分隔） | 可选 |
+| `WARP_SHARED_TOKENS` | 共享JWT刷新令牌（多个，逗号分隔） | 可选 |
+| `WARP_ANONYMOUS_TOKEN` | 匿名JWT刷新令牌 | 可选（有内置） |
 | `WARP_BRIDGE_URL` | Protobuf 桥接服务器 URL | `http://127.0.0.1:28888` |
 | `HTTP_PROXY` | HTTP 代理设置 | 空（禁用代理） |
 | `HTTPS_PROXY` | HTTPS 代理设置 | 空（禁用代理） |
@@ -317,11 +381,36 @@ warp-test
 
 ## 🔐 认证
 
-服务会自动处理 Warp 认证:
+服务会自动处理 Warp 认证，支持多token智能管理:
 
-1. **JWT 管理**: 自动令牌验证和刷新
-2. **匿名访问**: 在需要时回退到匿名令牌
-3. **令牌持久化**: 安全的令牌存储和重用
+1. **多Token池管理**: 支持配置多个refresh token，自动轮换和负载均衡
+2. **优先级策略**: 个人token > 共享token > 匿名token，确保个人账号优先使用
+3. **JWT 自动刷新**: 自动令牌验证和刷新，无需手动干预
+4. **故障自动转移**: Token失败时自动切换到下一个可用token
+5. **健康监控**: 实时监控token健康状态，自动禁用失败token
+6. **令牌持久化**: 安全的令牌存储和重用
+
+### Token管理工作流程
+
+```
+请求到达
+    ↓
+从Token池获取token（按优先级）
+    ↓
+尝试刷新JWT
+    ↓
+成功？ ──是──→ 返回JWT，重置失败计数
+    ↓
+    否
+    ↓
+失败计数+1
+    ↓
+达到最大失败次数？ ──是──→ 禁用该token
+    ↓
+    否
+    ↓
+切换到下一个token，重试
+```
 
 ## 🧪 开发
 

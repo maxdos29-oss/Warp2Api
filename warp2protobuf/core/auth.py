@@ -5,6 +5,7 @@ JWT Authentication for Warp API
 
 Handles JWT token management, refresh, and validation.
 Integrates functionality from refresh_jwt.py.
+Supports multi-token pool with priority-based selection.
 """
 import base64
 import json
@@ -17,6 +18,7 @@ from dotenv import load_dotenv, set_key
 
 from ..config.settings import REFRESH_TOKEN_B64, REFRESH_URL, CLIENT_VERSION, OS_CATEGORY, OS_NAME, OS_VERSION
 from .logging import logger, log
+from .token_pool import get_token_pool, TokenInfo
 
 
 def decode_jwt_payload(token: str) -> dict:
@@ -47,19 +49,17 @@ def is_token_expired(token: str, buffer_minutes: int = 5) -> bool:
     return (expiry_time - current_time) <= buffer_time
 
 
-async def refresh_jwt_token() -> dict:
-    """Refresh the JWT token using the refresh token.
+async def refresh_jwt_token_with_token_info(token_info: TokenInfo) -> dict:
+    """Refresh JWT token using a specific TokenInfo from the pool.
 
-    Prefers environment variable WARP_REFRESH_TOKEN when present; otherwise
-    falls back to the baked-in REFRESH_TOKEN_B64 payload.
+    Args:
+        token_info: TokenInfo object containing the refresh token
+
+    Returns:
+        dict: Token data with 'access_token' on success, empty dict on failure
     """
-    logger.info("Refreshing JWT token...")
-    # Prefer dynamic refresh token from environment if present
-    env_refresh = os.getenv("WARP_REFRESH_TOKEN")
-    if env_refresh:
-        payload = f"grant_type=refresh_token&refresh_token={env_refresh}".encode("utf-8")
-    else:
-        payload = base64.b64decode(REFRESH_TOKEN_B64)
+    logger.info(f"Refreshing JWT token using {token_info.name}...")
+    payload = f"grant_type=refresh_token&refresh_token={token_info.refresh_token}".encode("utf-8")
     headers = {
         "x-warp-client-version": CLIENT_VERSION,
         "x-warp-os-category": OS_CATEGORY,
@@ -79,15 +79,70 @@ async def refresh_jwt_token() -> dict:
             )
             if response.status_code == 200:
                 token_data = response.json()
-                logger.info("Token refresh successful")
+                logger.info(f"✅ Token refresh successful using {token_info.name}")
+
+                # Mark token as successful and cache JWT info
+                pool = await get_token_pool()
+                jwt = token_data.get("access_token", "")
+                if jwt:
+                    payload = decode_jwt_payload(jwt)
+                    expiry = payload.get('exp', 0) if payload else 0
+                    await pool.mark_token_success(token_info, jwt, expiry)
+
                 return token_data
             else:
-                logger.error(f"Token refresh failed: {response.status_code}")
+                logger.error(f"❌ Token refresh failed ({response.status_code}) using {token_info.name}")
                 logger.error(f"Response: {response.text}")
+
+                # Mark token as failed
+                pool = await get_token_pool()
+                await pool.mark_token_failed(token_info)
+
                 return {}
     except Exception as e:
-        logger.error(f"Error refreshing token: {e}")
+        logger.error(f"❌ Error refreshing token using {token_info.name}: {e}")
+
+        # Mark token as failed
+        pool = await get_token_pool()
+        await pool.mark_token_failed(token_info)
+
         return {}
+
+
+async def refresh_jwt_token() -> dict:
+    """Refresh the JWT token using the token pool.
+
+    Tries tokens from the pool in priority order (Personal > Shared > Anonymous).
+    Automatically fails over to next available token on failure.
+
+    Returns:
+        dict: Token data with 'access_token' on success, empty dict on failure
+    """
+    logger.info("🔄 Refreshing JWT token from pool...")
+    pool = await get_token_pool()
+
+    # Get pool stats for logging
+    stats = await pool.get_pool_stats()
+    logger.debug(f"Pool stats: {stats}")
+
+    # Try to get a token from the pool
+    max_attempts = stats.get('active_tokens', 1)
+    for attempt in range(max_attempts):
+        token_info = await pool.get_next_token()
+        if not token_info:
+            logger.error("❌ No available tokens in pool")
+            break
+
+        # Try to refresh with this token
+        token_data = await refresh_jwt_token_with_token_info(token_info)
+        if token_data and "access_token" in token_data:
+            return token_data
+
+        # If failed, loop will try next token
+        logger.warning(f"⚠️ Attempt {attempt + 1}/{max_attempts} failed, trying next token...")
+
+    logger.error("❌ All tokens failed to refresh JWT")
+    return {}
 
 
 def update_env_file(new_jwt: str) -> bool:
@@ -325,6 +380,46 @@ async def acquire_anonymous_access_token() -> str:
         return access
 
 
+async def print_token_pool_info():
+    """Print information about the token pool"""
+    pool = await get_token_pool()
+    stats = await pool.get_pool_stats()
+
+    logger.info("=== Token Pool Information ===")
+    logger.info(f"Total tokens: {stats['total_tokens']}")
+    logger.info(f"Active tokens: {stats['active_tokens']}")
+    logger.info(f"Failed tokens: {stats['failed_tokens']}")
+
+    for priority, info in stats['by_priority'].items():
+        if info['total'] > 0:
+            logger.info(f"{priority}: {info['active']}/{info['total']} active")
+
+
+async def check_token_pool_health():
+    """Check health of all tokens in the pool"""
+    pool = await get_token_pool()
+    health = await pool.health_check()
+
+    logger.info("=== Token Pool Health Check ===")
+    logger.info(f"Healthy tokens: {health['healthy_tokens']}/{health['total_tokens']}")
+    logger.info(f"Unhealthy tokens: {health['unhealthy_tokens']}")
+
+    for token_status in health['tokens']:
+        status_icon = "✅" if token_status['is_healthy'] else "❌"
+        logger.info(f"{status_icon} {token_status['name']} ({token_status['priority']}): "
+                   f"failures={token_status['failure_count']}, "
+                   f"active={token_status['is_active']}")
+
+    return health
+
+
+async def recover_failed_tokens():
+    """Attempt to recover failed tokens"""
+    pool = await get_token_pool()
+    recovered = await pool.recover_failed_tokens()
+    return recovered
+
+
 def print_token_info():
     current_jwt = os.getenv("WARP_JWT")
     if not current_jwt:
@@ -338,4 +433,4 @@ def print_token_info():
     if 'email' in payload:
         logger.info(f"Email: {payload['email']}")
     if 'user_id' in payload:
-        logger.info(f"User ID: {payload['user_id']}") 
+        logger.info(f"User ID: {payload['user_id']}")
